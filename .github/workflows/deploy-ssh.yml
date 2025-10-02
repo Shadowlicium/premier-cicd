@@ -1,0 +1,123 @@
+name: Deploy WordPress to SSH server
+
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      DEPLOY_DIR: /var/www/html
+      WP_DB_USER: user
+      WP_DB_PASSWORD: poseidon
+      WP_DB_NAME: wordpress
+      WP_DB_HOST: db:3306
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Docker versions
+        run: |
+          docker --version
+          docker compose version || true
+
+      - name: Generate docker-compose.yml
+        run: |
+          cat > docker-compose.yml <<'EOF'
+          version: '3.8'
+          services:
+            db:
+              image: mysql:8.0
+              container_name: db
+              environment:
+                MYSQL_DATABASE: wordpress
+                MYSQL_USER: user
+                MYSQL_PASSWORD: poseidon
+                MYSQL_ROOT_PASSWORD: rootpass
+              ports:
+                - "3306:3306"
+              healthcheck:
+                test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uuser", "-pposeidon"]
+                interval: 5s
+                retries: 10
+
+            wordpress:
+              image: wordpress:latest
+              container_name: wordpress
+              depends_on:
+                db:
+                  condition: service_healthy
+              ports:
+                - "8080:80"
+              environment:
+                WORDPRESS_DB_HOST: db:3306
+                WORDPRESS_DB_USER: user
+                WORDPRESS_DB_PASSWORD: poseidon
+                WORDPRESS_DB_NAME: wordpress
+          EOF
+
+      - name: Start services (CI)
+        run: docker compose up -d
+
+      - name: Wait for MySQL
+        run: |
+          for i in {1..20}; do
+            docker compose exec -T db mysql -uuser -pposeidon -e "SELECT 1" && break
+            echo "Waiting for MySQL..."
+            sleep 5
+          done
+
+      - name: Health check WordPress
+        run: |
+          curl -fsS http://localhost:8080/ >/dev/null
+
+      - name: Export DB (dump)
+        run: |
+          docker compose exec -T db mysqldump -uuser -pposeidon wordpress > wordpress.sql
+
+      # --- Déploiement distant ---
+      - name: Upload project to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          source: |
+            docker-compose.yml
+            wordpress.sql
+            .
+          target: ${{ env.DEPLOY_DIR }}
+          overwrite: true
+          strip_components: 0
+
+      - name: Remote deploy (compose down/up + import DB)
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+            mkdir -p $DEPLOY_DIR
+            cd $DEPLOY_DIR
+
+            # Arrêt si déjà lancé
+            docker compose -f docker-compose.yml down || true
+
+            # Démarrage
+            docker compose -f docker-compose.yml up -d
+
+            # Attente MySQL
+            for i in {1..20}; do
+              docker compose exec -T db mysql -uuser -pposeidon -e "SELECT 1" && break
+              echo "Waiting for remote MySQL..."
+              sleep 5
+            done
+
+            # Import DB
+            docker compose exec -T db mysql -uroot -prootpass wordpress < wordpress.sql
