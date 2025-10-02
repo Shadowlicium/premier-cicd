@@ -57,6 +57,19 @@ jobs:
                 WORDPRESS_DB_USER: user
                 WORDPRESS_DB_PASSWORD: poseidon
                 WORDPRESS_DB_NAME: wordpress
+                - name: Health check WordPress
+                run: |
+                  for i in {1..20}; do
+                  if curl -fsS http://localhost:8080/ >/dev/null; then
+                  echo "WordPress is up!"
+                  exit 0
+                fi
+                echo "Waiting for WordPress..."
+                sleep 5
+              done
+              echo "WordPress did not start in time"
+              exit 1
+
           EOF
 
       - name: Start services (CI)
